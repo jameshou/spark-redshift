@@ -16,24 +16,25 @@
 
 package com.databricks.spark.redshift
 
+import java.io.InputStreamReader
 import java.net.URI
 import java.sql.{Connection, Date, SQLException, Timestamp}
 
 import com.amazonaws.auth.AWSCredentials
-import com.amazonaws.services.s3.AmazonS3Client
-import org.apache.hadoop.fs.{Path, FileSystem}
+import com.amazonaws.services.s3.{AmazonS3Client, AmazonS3URI}
+import com.databricks.spark.redshift.Parameters.MergedParameters
+import com.eclipsesource.json.Json
+import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.TaskContext
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.{DataFrame, Row, SQLContext, SaveMode}
 import org.slf4j.LoggerFactory
 
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.Random
 import scala.util.control.NonFatal
-
-import com.databricks.spark.redshift.Parameters.MergedParameters
-
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Row, SaveMode, SQLContext}
-import org.apache.spark.sql.types._
 
 /**
  * Functions to write data to Redshift.
@@ -99,6 +100,17 @@ private[redshift] class RedshiftWriter(
     val fixedUrl = Utils.fixS3Url(manifestUrl)
     s"COPY ${params.table.get} FROM '$fixedUrl' CREDENTIALS '$credsString' FORMAT AS " +
       s"AVRO 'auto' manifest ${params.extraCopyOptions}"
+  }
+
+  private def copyEntryUrlSql(
+      sqlContext: SQLContext,
+      params: MergedParameters,
+      creds: AWSCredentials,
+      manifestEntryUrl: String): String = {
+    val credsString: String = AWSCredentialsUtils.getRedshiftCredentialsString(creds)
+    val fixedUrl = Utils.fixS3Url(manifestEntryUrl)
+    s"COPY ${params.table.get} FROM '$fixedUrl' CREDENTIALS '$credsString' FORMAT AS " +
+      s"AVRO 'auto' ${params.extraCopyOptions}"
   }
 
   /**
@@ -169,52 +181,120 @@ private[redshift] class RedshiftWriter(
     }
 
     manifestUrl.foreach { manifestUrl =>
-      // Load the temporary data into the new file
-      val copyStatement = copySql(data.sqlContext, params, creds, manifestUrl)
-      try {
-        jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
-      } catch {
-        case e: SQLException =>
-          // Try to query Redshift's STL_LOAD_ERRORS table to figure out why the load failed.
-          // See http://docs.aws.amazon.com/redshift/latest/dg/r_STL_LOAD_ERRORS.html for details.
-          val errorLookupQuery =
-            """
-              | SELECT *
-              | FROM stl_load_errors
-              | WHERE query = pg_last_query_id()
-            """.stripMargin
-          val detailedException: Option[SQLException] = try {
-            val results =
-              jdbcWrapper.executeQueryInterruptibly(conn.prepareStatement(errorLookupQuery))
-            if (results.next()) {
-              val errCode = results.getInt("err_code")
-              val errReason = results.getString("err_reason").trim
-              val columnLength: String =
-                Option(results.getString("col_length"))
-                  .map(_.trim)
-                  .filter(_.nonEmpty)
-                  .map(n => s"($n)")
-                  .getOrElse("")
-              val exceptionMessage =
-                s"""
-                   |Error (code $errCode) while loading data into Redshift: "$errReason"
-                   |Table name: ${params.table.get}
-                   |Column name: ${results.getString("colname").trim}
-                   |Column type: ${results.getString("type").trim}$columnLength
-                   |Raw line: ${results.getString("raw_line")}
-                   |Raw field value: ${results.getString("raw_field_value")}
-                  """.stripMargin
-              Some(new SQLException(exceptionMessage, e))
-            } else {
-              None
-            }
-          } catch {
-            case NonFatal(e2) =>
-              log.error("Error occurred while querying STL_LOAD_ERRORS", e2)
-              None
-          }
-          throw detailedException.getOrElse(e)
+      // Read the MANIFEST file to get the list of S3 part files that were written by Redshift.
+      // And load each entry individually
+      log.warn("FooBar ManifestURL: " + manifestUrl)
+      log.warn("FooBar version: " + classOf[AmazonS3URI])
+      val s3URI = new AmazonS3URI(Utils.fixS3Url(manifestUrl))
+      val s3Client = s3ClientFactory(creds)
+      val is = s3Client.getObject(s3URI.getBucket, s3URI.getKey).getObjectContent
+
+      log.warn("FooBar bucket: " + s3URI.getBucket)
+      log.warn("FooBar key: " + s3URI.getKey)
+      val s3Files = try {
+        val entries = Json.parse(new InputStreamReader(is)).asObject().get("entries").asArray()
+        entries.iterator().asScala.map(_.asObject().get("url").asString()).toSeq
+      } finally {
+        is.close()
       }
+
+      s3Files.foreach { entryUrl =>
+
+        // Load the temporary data into the new file
+        val copyStatement = copyEntryUrlSql(data.sqlContext, params, creds, entryUrl)
+        log.warn("FooBar Copy SQL Statement" + copyStatement)
+        try {
+          jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
+        } catch {
+          case e: SQLException =>
+            // Try to query Redshift's STL_LOAD_ERRORS table to figure out why the load failed.
+            // See http://docs.aws.amazon.com/redshift/latest/dg/r_STL_LOAD_ERRORS.html for details.
+            val errorLookupQuery =
+              """
+                | SELECT *
+                | FROM stl_load_errors
+                | WHERE query = pg_last_query_id()
+              """.stripMargin
+            val detailedException: Option[SQLException] = try {
+              val results =
+                jdbcWrapper.executeQueryInterruptibly(conn.prepareStatement(errorLookupQuery))
+              if (results.next()) {
+                val errCode = results.getInt("err_code")
+                val errReason = results.getString("err_reason").trim
+                val columnLength: String =
+                  Option(results.getString("col_length"))
+                    .map(_.trim)
+                    .filter(_.nonEmpty)
+                    .map(n => s"($n)")
+                    .getOrElse("")
+                val exceptionMessage =
+                  s"""
+                     |Error (code $errCode) while loading data into Redshift: "$errReason"
+                     |Table name: ${params.table.get}
+                     |Column name: ${results.getString("colname").trim}
+                     |Column type: ${results.getString("type").trim}$columnLength
+                     |Raw line: ${results.getString("raw_line")}
+                     |Raw field value: ${results.getString("raw_field_value")}
+                  """.stripMargin
+                Some(new SQLException(exceptionMessage, e))
+              } else {
+                None
+              }
+            } catch {
+              case NonFatal(e2) =>
+                log.error("Error occurred while querying STL_LOAD_ERRORS", e2)
+                None
+            }
+            throw detailedException.getOrElse(e)
+        }
+      }
+
+//      // Load the temporary data into the new file
+//      val copyStatement = copySql(data.sqlContext, params, creds, manifestUrl)
+//      try {
+//        jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
+//      } catch {
+//        case e: SQLException =>
+//          // Try to query Redshift's STL_LOAD_ERRORS table to figure out why the load failed.
+//          // See http://docs.aws.amazon.com/redshift/latest/dg/r_STL_LOAD_ERRORS.html for details.
+//          val errorLookupQuery =
+//            """
+//              | SELECT *
+//              | FROM stl_load_errors
+//              | WHERE query = pg_last_query_id()
+//            """.stripMargin
+//          val detailedException: Option[SQLException] = try {
+//            val results =
+//              jdbcWrapper.executeQueryInterruptibly(conn.prepareStatement(errorLookupQuery))
+//            if (results.next()) {
+//              val errCode = results.getInt("err_code")
+//              val errReason = results.getString("err_reason").trim
+//              val columnLength: String =
+//                Option(results.getString("col_length"))
+//                  .map(_.trim)
+//                  .filter(_.nonEmpty)
+//                  .map(n => s"($n)")
+//                  .getOrElse("")
+//              val exceptionMessage =
+//                s"""
+//                   |Error (code $errCode) while loading data into Redshift: "$errReason"
+//                   |Table name: ${params.table.get}
+//                   |Column name: ${results.getString("colname").trim}
+//                   |Column type: ${results.getString("type").trim}$columnLength
+//                   |Raw line: ${results.getString("raw_line")}
+//                   |Raw field value: ${results.getString("raw_field_value")}
+//                  """.stripMargin
+//              Some(new SQLException(exceptionMessage, e))
+//            } else {
+//              None
+//            }
+//          } catch {
+//            case NonFatal(e2) =>
+//              log.error("Error occurred while querying STL_LOAD_ERRORS", e2)
+//              None
+//          }
+//          throw detailedException.getOrElse(e)
+//      }
     }
 
     // Execute postActions
@@ -371,7 +451,8 @@ private[redshift] class RedshiftWriter(
 
     try {
       val tempDir = params.createPerQueryTempDir()
-      val manifestUrl = unloadData(sqlContext, data, tempDir)
+//      val manifestUrl = unloadData(sqlContext, data, tempDir)
+      val manifestUrl = Some("s3://udemy-bigdata-temp-east.s3.amazonaws.com/temp/31c9f96b-de38-4a89-a1c7-5b30bdf7cd72/manifest.json")
       if (saveMode == SaveMode.Overwrite && params.useStagingTable) {
         withStagingTable(conn, params.table.get, stagingTable => {
           val updatedParams = MergedParameters(params.parameters.updated("dbtable", stagingTable))

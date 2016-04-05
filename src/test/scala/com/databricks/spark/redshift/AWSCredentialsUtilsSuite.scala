@@ -16,6 +16,8 @@
 
 package com.databricks.spark.redshift
 
+import com.amazonaws.services.s3.AmazonS3URI
+
 import scala.language.implicitConversions
 
 import com.amazonaws.AmazonClientException
@@ -29,6 +31,15 @@ class AWSCredentialsUtilsSuite extends FunSuite {
 
   private implicit def string2Params(tempdir: String): MergedParameters = {
     MergedParameters(Map("tempdir" -> tempdir))
+  }
+
+  test("foo") {
+    val foo: String =
+       """s3://udemy-bigdata-temp-east/temp/4b2badb1-2316-40cc-b892-d08d5cb1a229/manifest.json"""
+    val k = new AmazonS3URI(foo)
+    println(k)
+
+
   }
 
   test("credentialsString with regular keys") {
