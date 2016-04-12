@@ -184,8 +184,12 @@ private[redshift] class RedshiftWriter(
       // Read the MANIFEST file to get the list of S3 part files that were written by Redshift.
       // And load each entry individually
       log.warn("FooBar ManifestURL: " + manifestUrl)
-      log.warn("FooBar version: " + classOf[AmazonS3URI])
-      val s3URI = new AmazonS3URI(Utils.fixS3Url(manifestUrl))
+// fix bug where unable to resolve hostname since aws-java-sdk 1.7.4 library requires full hostname
+val reManifestUrl = manifestUrl.replaceAll("udemy-bigdata-temp-east", "udemy-bigdata-temp-east.s3.amazonaws.com")
+      log.warn("FooBar Replaced ManifestURL: " + reManifestUrl)
+//log.warn("S3AFileSystem version: " + classOf[org.apache.hadoop.fs.s3a.S3AFileSystem].getProtectionDomain.getCodeSource().getLocation)
+      log.warn("FooBar version: " + classOf[AmazonS3URI].getProtectionDomain.getCodeSource().getLocation)
+      val s3URI = new AmazonS3URI(Utils.fixS3Url(reManifestUrl))
       val s3Client = s3ClientFactory(creds)
       val is = s3Client.getObject(s3URI.getBucket, s3URI.getKey).getObjectContent
 
@@ -451,8 +455,8 @@ private[redshift] class RedshiftWriter(
 
     try {
       val tempDir = params.createPerQueryTempDir()
-//      val manifestUrl = unloadData(sqlContext, data, tempDir)
-      val manifestUrl = Some("s3://udemy-bigdata-temp-east.s3.amazonaws.com/temp/31c9f96b-de38-4a89-a1c7-5b30bdf7cd72/manifest.json")
+      val manifestUrl = unloadData(sqlContext, data, tempDir)
+//      val manifestUrl = Some("s3://udemy-bigdata-temp-east/temp/61ce80b8-2eb8-4ee7-bea1-3d7a5707cec4/manifest.json")
       if (saveMode == SaveMode.Overwrite && params.useStagingTable) {
         withStagingTable(conn, params.table.get, stagingTable => {
           val updatedParams = MergedParameters(params.parameters.updated("dbtable", stagingTable))
