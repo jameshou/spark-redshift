@@ -183,18 +183,11 @@ private[redshift] class RedshiftWriter(
     manifestUrl.foreach { manifestUrl =>
       // Read the MANIFEST file to get the list of S3 part files that were written by Redshift.
       // And load each entry individually
-      log.warn("FooBar ManifestURL: " + manifestUrl)
-// fix bug where unable to resolve hostname since aws-java-sdk 1.7.4 library requires full hostname
-val reManifestUrl = manifestUrl.replaceAll("udemy-bigdata-temp-east", "udemy-bigdata-temp-east.s3.amazonaws.com")
-      log.warn("FooBar Replaced ManifestURL: " + reManifestUrl)
-//log.warn("S3AFileSystem version: " + classOf[org.apache.hadoop.fs.s3a.S3AFileSystem].getProtectionDomain.getCodeSource().getLocation)
-      log.warn("FooBar version: " + classOf[AmazonS3URI].getProtectionDomain.getCodeSource().getLocation)
-      val s3URI = new AmazonS3URI(Utils.fixS3Url(reManifestUrl))
+      log.warn("Using manifest url: " + manifestUrl)
+      val s3URI = new AmazonS3URI(Utils.fixS3Url(manifestUrl))
       val s3Client = s3ClientFactory(creds)
       val is = s3Client.getObject(s3URI.getBucket, s3URI.getKey).getObjectContent
 
-      log.warn("FooBar bucket: " + s3URI.getBucket)
-      log.warn("FooBar key: " + s3URI.getKey)
       val s3Files = try {
         val entries = Json.parse(new InputStreamReader(is)).asObject().get("entries").asArray()
         entries.iterator().asScala.map(_.asObject().get("url").asString()).toSeq
@@ -206,7 +199,7 @@ val reManifestUrl = manifestUrl.replaceAll("udemy-bigdata-temp-east", "udemy-big
 
         // Load the temporary data into the new file
         val copyStatement = copyEntryUrlSql(data.sqlContext, params, creds, entryUrl)
-        log.warn("FooBar Copy SQL Statement" + copyStatement)
+        log.warn("Execute copy SQL Statement: " + copyStatement)
         try {
           jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
         } catch {
@@ -252,53 +245,6 @@ val reManifestUrl = manifestUrl.replaceAll("udemy-bigdata-temp-east", "udemy-big
             throw detailedException.getOrElse(e)
         }
       }
-
-//      // Load the temporary data into the new file
-//      val copyStatement = copySql(data.sqlContext, params, creds, manifestUrl)
-//      try {
-//        jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
-//      } catch {
-//        case e: SQLException =>
-//          // Try to query Redshift's STL_LOAD_ERRORS table to figure out why the load failed.
-//          // See http://docs.aws.amazon.com/redshift/latest/dg/r_STL_LOAD_ERRORS.html for details.
-//          val errorLookupQuery =
-//            """
-//              | SELECT *
-//              | FROM stl_load_errors
-//              | WHERE query = pg_last_query_id()
-//            """.stripMargin
-//          val detailedException: Option[SQLException] = try {
-//            val results =
-//              jdbcWrapper.executeQueryInterruptibly(conn.prepareStatement(errorLookupQuery))
-//            if (results.next()) {
-//              val errCode = results.getInt("err_code")
-//              val errReason = results.getString("err_reason").trim
-//              val columnLength: String =
-//                Option(results.getString("col_length"))
-//                  .map(_.trim)
-//                  .filter(_.nonEmpty)
-//                  .map(n => s"($n)")
-//                  .getOrElse("")
-//              val exceptionMessage =
-//                s"""
-//                   |Error (code $errCode) while loading data into Redshift: "$errReason"
-//                   |Table name: ${params.table.get}
-//                   |Column name: ${results.getString("colname").trim}
-//                   |Column type: ${results.getString("type").trim}$columnLength
-//                   |Raw line: ${results.getString("raw_line")}
-//                   |Raw field value: ${results.getString("raw_field_value")}
-//                  """.stripMargin
-//              Some(new SQLException(exceptionMessage, e))
-//            } else {
-//              None
-//            }
-//          } catch {
-//            case NonFatal(e2) =>
-//              log.error("Error occurred while querying STL_LOAD_ERRORS", e2)
-//              None
-//          }
-//          throw detailedException.getOrElse(e)
-//      }
     }
 
     // Execute postActions
@@ -456,7 +402,6 @@ val reManifestUrl = manifestUrl.replaceAll("udemy-bigdata-temp-east", "udemy-big
     try {
       val tempDir = params.createPerQueryTempDir()
       val manifestUrl = unloadData(sqlContext, data, tempDir)
-//      val manifestUrl = Some("s3://udemy-bigdata-temp-east/temp/61ce80b8-2eb8-4ee7-bea1-3d7a5707cec4/manifest.json")
       if (saveMode == SaveMode.Overwrite && params.useStagingTable) {
         withStagingTable(conn, params.table.get, stagingTable => {
           val updatedParams = MergedParameters(params.parameters.updated("dbtable", stagingTable))
